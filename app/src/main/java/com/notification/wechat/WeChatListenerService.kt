@@ -14,6 +14,8 @@ import android.os.Looper
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
+import android.content.pm.ServiceInfo
+import android.os.Build
 
 class WeChatListenerService : NotificationListenerService() {
 
@@ -21,15 +23,34 @@ class WeChatListenerService : NotificationListenerService() {
     private val FOREGROUND_ID = 9999
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 创建前台服务通知，防止被杀
-        createNotificationChannel()
-        val notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("微信同步服务运行中")
-            .setContentText("正在监听通知并进行蓝牙检测...")
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .build()
-        startForeground(FOREGROUND_ID, notification)
-        return Service.START_STICKY // 被杀后重启
+        // 1. 开始 try 块
+        try {
+            createNotificationChannel()
+            val notification = Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle("微信同步服务运行中")
+                .setContentText("正在后台运行")
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .build()
+
+            // 2. 针对 Android 14 的前台服务类型检查
+            if (Build.VERSION.SDK_INT >= 34) {
+                // 如果你还在用 SDK 33 编译但想保留这行，可能会报红，建议先改 build.gradle 到 34
+                // 如果暂时改不了 SDK，可以把下面这个 if 块删掉，只保留 else 里的内容
+                startForeground(
+                    FOREGROUND_ID,
+                    notification,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                )
+            } else {
+                startForeground(FOREGROUND_ID, notification)
+            }
+
+        } catch (e: Exception) { // 3. 这里的 catch 必须紧跟在上面的 } 后面
+            // 4. 修复了 Log 报错：去掉了 tag= 和 msg=
+            Log.e("WeChatService", "前台服务启动失败: ${e.message}")
+        }
+
+        return Service.START_STICKY
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
