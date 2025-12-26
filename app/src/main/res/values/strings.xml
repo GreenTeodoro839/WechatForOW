@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Wechat</string>
+    <string name="accessibility_desc">用于保持微信同步服务后台运行</string>
+</resources>
