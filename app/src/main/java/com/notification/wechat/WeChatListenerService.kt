@@ -8,67 +8,68 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.Handler
-import android.os.IBinder
 import android.os.Looper
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import android.util.Log
-import android.content.pm.ServiceInfo
-import android.os.Build
 
 class WeChatListenerService : NotificationListenerService() {
 
-    private val CHANNEL_ID = "WeChat_Bypass_Channel"
+    // 【核心修改】定义两个不同的身份证号
+    private val CHANNEL_ID_SERVICE = "Channel_KeepAlive"   // 1. 专门给那个烦人的常驻通知用
+    private val CHANNEL_ID_MESSAGE = "Channel_WeChat_Msg"  // 2. 专门给转发的微信消息用
+
     private val FOREGROUND_ID = 9999
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 1. 开始 try 块
         try {
-            createNotificationChannel()
-            val notification = Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("微信同步服务运行中")
-                .setContentText("正在后台运行")
+            createNotificationChannels() // 创建两个渠道
+
+            // 【核心修改】这里使用 SERVICE 渠道，用户可以单独屏蔽这个
+            val notification = Notification.Builder(this, CHANNEL_ID_SERVICE)
+                .setContentTitle("微信同步服务")
+                .setContentText("服务运行中 (可长按关闭此通知)")
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .build()
 
-            // 2. 针对 Android 14 的前台服务类型检查
+            // 针对 Android 14+ 的类型声明
             if (Build.VERSION.SDK_INT >= 34) {
-                // 如果你还在用 SDK 33 编译但想保留这行，可能会报红，建议先改 build.gradle 到 34
-                // 如果暂时改不了 SDK，可以把下面这个 if 块删掉，只保留 else 里的内容
                 startForeground(
                     FOREGROUND_ID,
                     notification,
-                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                 )
             } else {
                 startForeground(FOREGROUND_ID, notification)
             }
 
-        } catch (e: Exception) { // 3. 这里的 catch 必须紧跟在上面的 } 后面
-            // 4. 修复了 Log 报错：去掉了 tag= 和 msg=
+        } catch (e: Exception) {
             Log.e("WeChatService", "前台服务启动失败: ${e.message}")
         }
-
         return Service.START_STICKY
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        if (sbn == null) return
-        val packageName = sbn.packageName
+        try {
+            if (sbn == null) return
+            // 过滤掉自己发的两种通知 (防止自己转发自己)
+            if (sbn.packageName == packageName) return
 
-        // 核心过滤：只看微信，且排除自己发的重发通知（防止死循环）
-        if (packageName == "com.tencent.mm" && sbn.id != 10086) {
-            checkAndResend(sbn)
+            if (sbn.packageName == "com.tencent.mm") {
+                Thread {
+                    try {
+                        checkAndResend(sbn)
+                    } catch (e: Exception) {
+                        Log.e("WeChatService", "处理通知出错: ${e.message}")
+                    }
+                }.start()
+            }
+        } catch (e: Exception) {
+            Log.e("WeChatService", "onNotificationPosted 崩溃: ${e.message}")
         }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        // 发送广播尝试重启自己
-        val restartIntent = Intent(this, BootReceiver::class.java)
-        restartIntent.action = "com.notification.wechat.RESTART_SERVICE"
-        sendBroadcast(restartIntent)
     }
 
     private fun checkAndResend(sbn: StatusBarNotification) {
@@ -76,70 +77,91 @@ class WeChatListenerService : NotificationListenerService() {
         val targetMac = prefs.getString("mac", "") ?: return
         if (targetMac.isEmpty()) return
 
-        // 蓝牙反射检测
         if (!isBluetoothConnected(targetMac)) {
             Log.d("WeChatBypass", "蓝牙未连接，准备重发")
-            resendNotification(sbn, prefs.getInt("delay", 3))
-        } else {
-            Log.d("WeChatBypass", "蓝牙已连接，忽略")
+            Handler(Looper.getMainLooper()).post {
+                resendNotification(sbn, prefs.getInt("delay", 3))
+            }
         }
     }
 
     private fun isBluetoothConnected(mac: String): Boolean {
-        val adapter = BluetoothAdapter.getDefaultAdapter()
-        if (adapter == null || !adapter.isEnabled) return false
-
         try {
+            val adapter = BluetoothAdapter.getDefaultAdapter()
+            if (adapter == null || !adapter.isEnabled) return false
             val device = adapter.getRemoteDevice(mac)
-            // ColorOS 专用的反射大法，检测隐藏的 API
             val method = BluetoothDevice::class.java.getMethod("isConnected")
             return method.invoke(device) as Boolean
         } catch (e: Exception) {
-            // 如果反射失败，尝试备用方案：检查是否Bonded（虽然不代表Connected，但在某些rom上是唯一能获取的状态）
-            // 这里为了稳妥，如果报错默认当做未连接，或者你可以根据情况调整
-            Log.e("WeChatBypass", "反射检测失败: ${e.message}")
             return false
         }
     }
 
     private fun resendNotification(sbn: StatusBarNotification, delaySeconds: Int) {
-        val originalNotification = sbn.notification
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        try {
+            val originalNotification = sbn.notification
+            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-        // 克隆通知
-        val newNotification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle(originalNotification.extras.getString(Notification.EXTRA_TITLE))
-            .setContentText(originalNotification.extras.getString(Notification.EXTRA_TEXT))
-            .setSmallIcon(R.mipmap.ic_launcher)
-            // 关键：复制原始的 PendingIntent，这样点击就能跳回微信
-            .setContentIntent(originalNotification.contentIntent)
-            .setAutoCancel(true)
-            .build()
+            val title = originalNotification.extras.getString(Notification.EXTRA_TITLE) ?: "微信"
+            val text = originalNotification.extras.getString(Notification.EXTRA_TEXT) ?: "收到新消息"
 
-        // 发送 ID 为 10086 的通知
-        notificationManager.notify(10086, newNotification)
+            // 【核心修改】这里使用 MESSAGE 渠道，确保这个通知能发出来
+            val newNotification = Notification.Builder(this, CHANNEL_ID_MESSAGE)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentIntent(originalNotification.contentIntent)
+                .setAutoCancel(true)
+                .build()
 
-        // N秒后自动删除
-        Handler(Looper.getMainLooper()).postDelayed({
-            notificationManager.cancel(10086)
-            Log.d("WeChatBypass", "通知已自动移除")
-        }, delaySeconds * 1000L)
+            notificationManager.notify(10086, newNotification)
+
+            Handler(Looper.getMainLooper()).postDelayed({
+                try {
+                    notificationManager.cancel(10086)
+                } catch (e: Exception) { }
+            }, delaySeconds * 1000L)
+        } catch (e: Exception) {
+            Log.e("WeChatService", "重发失败: ${e.message}")
+        }
     }
 
-    private fun createNotificationChannel() {
-        val name = "微信同步转发" // 确保名字一致
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            val restartIntent = Intent(this, BootReceiver::class.java)
+            restartIntent.action = "com.notification.wechat.RESTART_SERVICE"
+            sendBroadcast(restartIntent)
+        } catch (e: Exception) { }
+    }
 
-        // 【关键修改】改为 IMPORTANCE_LOW
-        val importance = NotificationManager.IMPORTANCE_LOW
+    // 【核心修改】同时创建两个渠道
+    private fun createNotificationChannels() {
+        try {
+            val notificationManager = getSystemService(NotificationManager::class.java)
 
-        val channel = NotificationChannel(CHANNEL_ID, name, importance)
-        channel.description = "用于绕过限制转发微信通知"
+            // 1. 保活服务渠道 (建议用户关闭)
+            val serviceChannel = NotificationChannel(
+                CHANNEL_ID_SERVICE,
+                "后台保活服务 (可关闭)", // 名字写得直白点
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "此通知用于保持App在后台运行，可以在设置中关闭，不影响转发功能"
+                setShowBadge(false)
+            }
 
-        // 显式关闭震动和声音
-        channel.enableVibration(false)
-        channel.setSound(null, null)
+            // 2. 消息转发渠道 (必须开启)
+            val messageChannel = NotificationChannel(
+                CHANNEL_ID_MESSAGE,
+                "微信消息转发",
+                NotificationManager.IMPORTANCE_DEFAULT // 即使静音也需要有展示级别
+            ).apply {
+                description = "用于显示转发的微信消息"
+                enableVibration(false)
+                setSound(null, null)
+            }
 
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager.createNotificationChannel(channel)
+            notificationManager.createNotificationChannels(listOf(serviceChannel, messageChannel))
+        } catch (e: Exception) { }
     }
 }
