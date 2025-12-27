@@ -71,6 +71,10 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }, 1000)
+            it.postDelayed({
+                // 如果是服务，不会受 finish() 影响，它会继续在后台跑
+                finish()
+            }, 2000)
         }
     }
 
